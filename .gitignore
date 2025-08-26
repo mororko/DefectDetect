@@ -1,0 +1,15 @@
+# Entorno virtual
+.venv/
+venv/
+ENV/
+*.pyc
+__pycache__/
+
+# Archivos de entrenamiento y modelos
+data/good/*
+data/bad/*
+models/model.pkl
+
+# Archivos temporales
+*.log
+*.tmp

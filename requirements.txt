@@ -1,0 +1,9 @@
+fastapi==0.116.1
+uvicorn>=0.30
+gradio>=4.44
+opencv-python>=4.9
+scikit-learn>=1.4
+numpy>=1.26
+pydantic>=2.8
+pillow>=10.3
+joblib>=1.3
