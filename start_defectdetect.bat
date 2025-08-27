@@ -10,6 +10,9 @@ call .venv\Scripts\activate
 :: (Opcional) resetear dataset y modelo en cada arranque
 :: python reset_dataset.py
 
+:: (Opcional) configurar nivel de logging
+:: set LOG_LEVEL=DEBUG
+
 :: Arrancar el servidor
 python app.py
 
