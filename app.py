@@ -2,7 +2,7 @@
 """
 DefectDetect: Clasificación simple de defectos con OpenCV + scikit-learn
 - UI web para capturar desde la webcam (backend), etiquetar (BUENA/MALA), entrenar y clasificar.
-- API REST (FastAPI): /predict, /feedback, /train, /camera/start|stop|status
+- API REST (FastAPI): /predict, /feedback_webcam, /train, /camera/start|stop|status
 
 Requisitos:
   pip install opencv-python fastapi uvicorn gradio scikit-learn numpy pydantic pillow joblib
@@ -11,13 +11,6 @@ Ejecución:
   python app.py
   # UI:   http://127.0.0.1:7860/ui
   # Docs: http://127.0.0.1:7860/docs
-
-Estructura de datos:
-  data/
-    good/   (imágenes etiquetadas BUENA)
-    bad/    (imágenes etiquetadas MALA)
-  models/
-    model.pkl
 """
 from __future__ import annotations
 
@@ -68,7 +61,7 @@ NBINS = 9
 # ==========================
 # Webcam (gestor persistente)
 # ==========================
-CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "1"))   # ajusta si tienes varias cámaras
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "1"))
 CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "1280"))
 CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "720"))
 
@@ -109,7 +102,7 @@ class CameraManager:
             if not self.running or self.cap is None:
                 if require_running:
                     raise RuntimeError("La cámara está apagada (backend no iniciado).")
-                # auto-start en caso flexible
+                # auto-start flexible
                 self.start()
             ok, frame = self.cap.read()
             if not ok or frame is None:
@@ -119,14 +112,14 @@ class CameraManager:
 cam = CameraManager()
 
 # ==========================
-# Última foto (estado compartido UI/API)
+# Última foto + resultado (estado compartido UI/API)
 # ==========================
 LAST_FRAME: Optional[np.ndarray] = None
 LAST_VERSION: int = 0
+LAST_RESULT: Optional[Dict] = None
 _LAST_LOCK = threading.Lock()
 
 def set_last_frame(frame: np.ndarray) -> None:
-    """Guarda la última foto y sube la versión para que la UI se actualice sola."""
     global LAST_FRAME, LAST_VERSION
     with _LAST_LOCK:
         LAST_FRAME = frame.copy()
@@ -139,6 +132,15 @@ def get_last_frame() -> Optional[np.ndarray]:
 def get_last_version() -> int:
     with _LAST_LOCK:
         return LAST_VERSION
+
+def set_last_result(res: Dict) -> None:
+    global LAST_RESULT
+    with _LAST_LOCK:
+        LAST_RESULT = dict(res)
+
+def get_last_result() -> Optional[Dict]:
+    with _LAST_LOCK:
+        return None if LAST_RESULT is None else dict(LAST_RESULT)
 
 # ==========================
 # Utilidades de imagen
@@ -200,11 +202,10 @@ def save_model(model: Pipeline) -> None:
     joblib.dump(model, MODEL_PATH)
 
 def build_model() -> Pipeline:
-    clf = Pipeline([
+    return Pipeline([
         ("scaler", StandardScaler(with_mean=False)),
         ("lr", LogisticRegression(max_iter=2000))
     ])
-    return clf
 
 def dataset_iter() -> List[Tuple[str, int]]:
     pairs: List[Tuple[str, int]] = []
@@ -227,47 +228,35 @@ def load_dataset() -> Tuple[np.ndarray, np.ndarray]:
         y.append(label)
     if not X:
         raise RuntimeError("El dataset está vacío. Etiqueta algunas imágenes primero.")
-    X_arr = np.vstack(X)
-    y_arr = np.array(y, dtype=np.int32)
-    return X_arr, y_arr
+    return np.vstack(X), np.array(y, dtype=np.int32)
 
 def train_model() -> Dict:
     X, y = load_dataset()
     model = build_model()
-
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     model.fit(Xtr, ytr)
     ypred = model.predict(Xte)
-    if hasattr(model.named_steps["lr"], "predict_proba"):
-        yprob = model.predict_proba(Xte)[:, 1]
-    else:
-        dec = model.decision_function(Xte)
-        yprob = (dec - dec.min()) / (dec.max() - dec.min() + 1e-8)
 
     acc = round(float(accuracy_score(yte, ypred)), 2)
     cm = confusion_matrix(yte, ypred).tolist()
     report = classification_report(yte, ypred, target_names=["MALA", "BUENA"], output_dict=True)
-    # redondeo del report
-    for k, v in list(report.items()):
+    for k, v in report.items():
         if isinstance(v, dict):
-            for kk, vv in list(v.items()):
-                if isinstance(vv, (int, float)):
-                    report[k][kk] = round(float(vv), 2)
+            for kk in v:
+                try:
+                    v[kk] = round(float(v[kk]), 2)
+                except Exception:
+                    pass
 
     save_model(model)
-    return {
-        "accuracy": acc,
-        "confusion_matrix": cm,
-        "report": report,
-        "n_train": int(len(ytr)),
-        "n_test": int(len(yte)),
-        "classes": {"0": "MALA", "1": "BUENA"},
-    }
+    return {"accuracy": acc, "confusion_matrix": cm, "report": report,
+            "n_train": int(len(ytr)), "n_test": int(len(yte)),
+            "classes": {"0": "MALA", "1": "BUENA"}}
 
 def predict_image(img_bgr: np.ndarray) -> Dict:
     model = load_model()
     if model is None:
-        raise RuntimeError("No hay modelo entrenado. Entrena primero con algunas imágenes etiquetadas.")
+        raise RuntimeError("No hay modelo entrenado. Entrena primero.")
     feats = extract_features(img_bgr).reshape(1, -1)
     if hasattr(model.named_steps["lr"], "predict_proba"):
         prob_good = float(model.predict_proba(feats)[0, 1])
@@ -283,12 +272,7 @@ def predict_image(img_bgr: np.ndarray) -> Dict:
 def save_labeled_image(img_bgr: np.ndarray, label: str) -> str:
     ts = time.strftime("%Y%m%d-%H%M%S")
     fname = f"{ts}_{uuid.uuid4().hex[:8]}.jpg"
-    if label.upper() in {"BUENA", "GOOD", "1"}:
-        outdir = GOOD_DIR
-    elif label.upper() in {"MALA", "BAD", "0"}:
-        outdir = BAD_DIR
-    else:
-        raise ValueError("Etiqueta inválida. Usa 'BUENA' o 'MALA'.")
+    outdir = GOOD_DIR if label.upper() in {"BUENA","GOOD","1"} else BAD_DIR
     path = outdir / fname
     cv2.imwrite(str(path), img_bgr)
     return str(path)
@@ -296,7 +280,7 @@ def save_labeled_image(img_bgr: np.ndarray, label: str) -> str:
 # ==========================
 # API FastAPI
 # ==========================
-app = FastAPI(title="DefectDetect API", version="1.5.1")
+app = FastAPI(title="DefectDetect API", version="1.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -320,125 +304,79 @@ async def api_predict(file: UploadFile = File(None)):
     try:
         if file is None:
             img = capture_snapshot(require_running=True)
-            set_last_frame(img)  # <-- actualiza la UI
+            set_last_frame(img)   # para sincronizar UI
         else:
             data = await file.read()
             img = imread_any(data)
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=f"camera_off: {e}")
-    except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
+    except RuntimeError as e: raise HTTPException(status_code=409, detail=f"camera_off: {e}")
+    except TimeoutError as e: raise HTTPException(status_code=504, detail=str(e))
     res = predict_image(img)
+    set_last_result(res)        # para sincronizar UI
     return JSONResponse(res)
 
 @app.post("/predict_webcam", response_model=PredictResponse)
 async def api_predict_webcam():
     try:
         img = capture_snapshot(require_running=True)
-        set_last_frame(img)  # <-- actualiza la UI
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=f"camera_off: {e}")
-    except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
+        set_last_frame(img)     # para sincronizar UI
+    except RuntimeError as e: raise HTTPException(status_code=409, detail=f"camera_off: {e}")
+    except TimeoutError as e: raise HTTPException(status_code=504, detail=str(e))
     res = predict_image(img)
+    set_last_result(res)        # para sincronizar UI
     return JSONResponse(res)
 
-@app.post("/feedback")
-async def api_feedback(label: str = Form(..., description="BUENA o MALA"),
-                       file: UploadFile = File(...)):
-    data = await file.read()
-    img = imread_any(data)
-    path = save_labeled_image(img, label)
-    return {"saved": True, "path": path}
-
 @app.post("/feedback_webcam")
-async def api_feedback_webcam(label: str = Form(..., description="BUENA o MALA")):
-    try:
-        img = capture_snapshot(require_running=True)
-        set_last_frame(img)  # opcional
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=f"camera_off: {e}")
-    except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
+async def api_feedback_webcam(label: str = Form(...)):
+    img = capture_snapshot(require_running=True)
+    set_last_frame(img)
     path = save_labeled_image(img, label)
     return {"saved": True, "path": path}
 
 @app.post("/train")
 async def api_train():
     try:
-        metrics = train_model()
-        return {"trained": True, **metrics}
+        return {"trained": True, **train_model()}
     except Exception as e:
         return JSONResponse(status_code=400, content={"trained": False, "error": str(e)})
 
 @app.post("/camera/start")
-async def api_camera_start():
-    cam.start()
-    return {"running": True}
+async def api_camera_start(): cam.start(); return {"running": True}
 
 @app.post("/camera/stop")
-async def api_camera_stop():
-    cam.stop()
-    return {"running": False}
+async def api_camera_stop(): cam.stop(); return {"running": False}
 
 @app.get("/camera/status")
-async def api_camera_status():
-    return {"running": cam.running, "index": cam.index, "width": cam.width, "height": cam.height}
-
-# (Opcional) Ver la última foto directamente como JPG
-@app.get("/last_frame.jpg")
-async def last_frame_jpg():
-    frame = get_last_frame()
-    if frame is None:
-        raise HTTPException(status_code=404, detail="No hay foto disponible")
-    ok, buf = cv2.imencode(".jpg", frame)
-    if not ok:
-        raise HTTPException(status_code=500, detail="Error codificando imagen")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+async def api_camera_status(): return {"running": cam.running}
 
 # ==========================
-# UI con Gradio (montada en /ui)
+# UI con Gradio (mantiene funciones de todos los botones)
 # ==========================
-def ui_classify(image: np.ndarray) -> Tuple[str, Dict[str, float]]:
-    # por compatibilidad si vuelves a usar el widget de imagen
-    if image is None:
-        return "Sube o toma una imagen", {}
-    img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    try:
-        r = predict_image(img_bgr)
-        label = f"Resultado: {r['label']}"
-        scores = {"BUENA": r["prob_good"], "MALA": r["prob_bad"]}
-        return label, scores
-    except Exception as e:
-        return str(e), {}
-
-def ui_classify_backend() -> Tuple[str, Dict[str, float], np.ndarray]:
-    try:
-        frame_bgr = capture_snapshot(require_running=True)
-        set_last_frame(frame_bgr)
-        r = predict_image(frame_bgr)
-        label = f"Resultado: {r['label']}"
-        scores = {"BUENA": r["prob_good"], "MALA": r["prob_bad"]}
-        frame_rgb = bgr_to_rgb(frame_bgr)
-        return label, scores, frame_rgb
-    except RuntimeError as e:
-        return f"Error: cámara apagada. Pulsa 'Encender cámara (backend)'. Detalle: {e}", {}, np.zeros((10,10,3), dtype=np.uint8)
-    except TimeoutError as e:
-        return f"Error: timeout capturando frame ({e})", {}, np.zeros((10,10,3), dtype=np.uint8)
-    except Exception as e:
-        return f"Error: {e}", {}, np.zeros((10,10,3), dtype=np.uint8)
-
 def ui_take_photo_backend() -> Tuple[str, np.ndarray]:
+    """Solo captura; no clasifica."""
     try:
         frame = capture_snapshot(require_running=True)
         set_last_frame(frame)
         return "Foto capturada.", bgr_to_rgb(frame)
     except RuntimeError as e:
-        return f"Error: cámara apagada. Pulsa 'Encender cámara (backend)'. Detalle: {e}", np.zeros((10,10,3), dtype=np.uint8)
+        return f"Error: cámara apagada. {e}", np.zeros((10,10,3), dtype=np.uint8)
     except TimeoutError as e:
-        return f"Error: timeout capturando frame ({e})", np.zeros((10,10,3), dtype=np.uint8)
+        return f"Error: timeout ({e})", np.zeros((10,10,3), dtype=np.uint8)
+
+def ui_classify_backend() -> Tuple[str, Dict[str, float], np.ndarray]:
+    """Captura y clasifica; actualiza todo."""
+    try:
+        frame_bgr = capture_snapshot(require_running=True)
+        set_last_frame(frame_bgr)
+        r = predict_image(frame_bgr)
+        set_last_result(r)
+        return f"Resultado: {r['label']}", {"BUENA": r["prob_good"], "MALA": r["prob_bad"]}, bgr_to_rgb(frame_bgr)
+    except RuntimeError as e:
+        return f"Error: cámara apagada. {e}", {}, np.zeros((10,10,3), dtype=np.uint8)
+    except TimeoutError as e:
+        return f"Error: timeout ({e})", {}, np.zeros((10,10,3), dtype=np.uint8)
 
 def ui_save_good_backend() -> Tuple[str, np.ndarray]:
+    """Guarda última foto como BUENA; no clasifica."""
     try:
         frame = get_last_frame()
         if frame is None:
@@ -452,6 +390,7 @@ def ui_save_good_backend() -> Tuple[str, np.ndarray]:
         return f"Error: timeout ({e})", np.zeros((10,10,3), dtype=np.uint8)
 
 def ui_save_bad_backend() -> Tuple[str, np.ndarray]:
+    """Guarda última foto como MALA; no clasifica."""
     try:
         frame = get_last_frame()
         if frame is None:
@@ -477,23 +416,32 @@ def ui_train() -> str:
     except Exception as e:
         return f"Error al entrenar: {e}"
 
-# ---- Pull desde la UI para sincronizar cuando se llama /predict_webcam vía API ----
+# ---- Timer: refresco automático si API externa tomó una nueva foto y predijo ----
 def ui_pull_last(prev_version: int):
     """
-    Si hay nueva foto (versión distinta), devuelve (versión, imagen RGB actualizada).
-    Si no hay cambios, mantiene la versión y no toca la imagen (gr.update()).
+    Si hay nueva foto (versión distinta), devuelve:
+      - nueva versión
+      - imagen RGB actualizada
+      - label de probabilidades
+      - texto de resultado
+    Si no hay cambios, devuelve updates vacíos para no tocar la UI.
     """
     try:
         ver = get_last_version()
         if ver != prev_version:
             frame = get_last_frame()
-            if frame is None:
-                return ver, gr.update()
-            return ver, gr.update(value=bgr_to_rgb(frame))
+            res = get_last_result()
+            img_update = gr.update(value=bgr_to_rgb(frame)) if frame is not None else gr.update()
+            if res:
+                lbl_update = gr.update(value={"BUENA": res["prob_good"], "MALA": res["prob_bad"]})
+                txt_update = gr.update(value=f"Resultado: {res['label']}")
+            else:
+                lbl_update, txt_update = gr.update(), gr.update()
+            return ver, img_update, lbl_update, txt_update
         else:
-            return prev_version, gr.update()
+            return prev_version, gr.update(), gr.update(), gr.update()
     except Exception:
-        return prev_version, gr.update()
+        return prev_version, gr.update(), gr.update(), gr.update()
 
 with gr.Blocks(title="DefectDetect UI") as demo:
     gr.Markdown("# DefectDetect\nBackend: captura, etiqueta, entrena y clasifica.")
@@ -501,10 +449,8 @@ with gr.Blocks(title="DefectDetect UI") as demo:
     with gr.Row():
         out_img = gr.Image(label="Última captura (backend)", interactive=False)
         lbl = gr.Label(label="Probabilidades")
-
     out_text = gr.Textbox(label="Estado / Resultado", interactive=False)
 
-    # Estado de versión para sincronizar UI <-> API
     ver_state = gr.State(0)
 
     with gr.Row():
@@ -528,20 +474,18 @@ with gr.Blocks(title="DefectDetect UI") as demo:
     btn_on.click(fn=ui_camera_start, inputs=None, outputs=out_text)
     btn_off.click(fn=ui_camera_stop, inputs=None, outputs=out_text)
 
-    # Captura / Clasificación / Etiquetado
-    btn_snap.click(fn=ui_take_photo_backend, inputs=None, outputs=[out_text, out_img])
-    btn_pred.click(fn=ui_classify_backend, inputs=None, outputs=[out_text, lbl, out_img])
-    btn_good.click(fn=ui_save_good_backend, inputs=None, outputs=[out_text, out_img])
-    btn_bad.click(fn=ui_save_bad_backend, inputs=None, outputs=[out_text, out_img])
+    # Botones principales (mantienen su función original)
+    btn_snap.click(fn=ui_take_photo_backend, inputs=None, outputs=[out_text, out_img])                 # solo foto
+    btn_pred.click(fn=ui_classify_backend, inputs=None, outputs=[out_text, lbl, out_img])             # foto + clasificar
+    btn_good.click(fn=ui_save_good_backend, inputs=None, outputs=[out_text, out_img])                 # guarda última
+    btn_bad.click(fn=ui_save_bad_backend, inputs=None, outputs=[out_text, out_img])                   # guarda última
+    btn_train.click(fn=ui_train, inputs=None, outputs=out_text)                                       # entrena
 
-    # Entrenamiento
-    btn_train.click(fn=ui_train, inputs=None, outputs=out_text)
-
-    # Timer: refresca la última imagen si la API externo tomó una nueva (cada 0.5 s)
+    # Timer: refresca imagen + resultados si la API externa tomó y predijo una nueva
     gr.Timer(0.5).tick(
         fn=ui_pull_last,
         inputs=[ver_state],
-        outputs=[ver_state, out_img]
+        outputs=[ver_state, out_img, lbl, out_text]
     )
 
 # Montar Gradio dentro de FastAPI
