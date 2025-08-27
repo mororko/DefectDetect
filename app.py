@@ -21,16 +21,14 @@ Estructura de datos:
 """
 from __future__ import annotations
 
-import io
 import os
 import time
 import uuid
 import json
 import threading
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict, Union
+from typing import Tuple, Optional, List, Dict
 
-import logging
 import cv2
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -40,19 +38,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 import joblib
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import gradio as gr
-
-# ==========================
-# Logging
-# ==========================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-logger = logging.getLogger(__name__)
 
 # ==========================
 # Configuración
@@ -77,7 +68,7 @@ NBINS = 9
 # ==========================
 # Webcam (gestor persistente)
 # ==========================
-CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))     # cambia si tienes varias cámaras
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "1"))   # ajusta si tienes varias cámaras
 CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "1280"))
 CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "720"))
 
@@ -93,35 +84,35 @@ class CameraManager:
     def start(self):
         with self.lock:
             if self.running:
-                logger.debug("Camera already running")
                 return
             self.cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(self.index)
-            if not self.cap.isOpened():
-                logger.error("No se pudo abrir la cámara index=%s", self.index)
+            if not self.cap or not self.cap.isOpened():
                 self.cap = None
                 raise RuntimeError(f"No se pudo abrir la cámara index={self.index}")
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
             self.running = True
-            logger.info("Cámara iniciada (index=%s)", self.index)
 
     def stop(self):
         with self.lock:
             if self.cap is not None:
                 self.cap.release()
-                logger.info("Cámara detenida")
             self.cap = None
             self.running = False
 
-    def read(self) -> np.ndarray:
+    def read(self, require_running: bool = False) -> np.ndarray:
+        """
+        Lee un frame. Si require_running=True y la cámara está apagada, lanza RuntimeError.
+        Si require_running=False y la cámara está apagada, intenta autoarrancar.
+        """
         with self.lock:
             if not self.running or self.cap is None:
-                # Arrancar automáticamente si no está corriendo
-                logger.debug("Cámara no estaba activa, iniciando automáticamente")
+                if require_running:
+                    raise RuntimeError("La cámara está apagada (backend no iniciado).")
+                # auto-start en caso flexible
                 self.start()
             ok, frame = self.cap.read()
             if not ok or frame is None:
-                logger.error("Fallo al leer frame de la cámara")
                 raise RuntimeError("Fallo al leer frame de la cámara.")
             return frame
 
@@ -144,11 +135,10 @@ def get_last_frame() -> Optional[np.ndarray]:
 # Utilidades de imagen
 # ==========================
 def imread_any(data: bytes) -> np.ndarray:
-    """Lee una imagen desde bytes a BGR (OpenCV)."""
     arr = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("No se pudo decodificar la imagen. Asegúrate de enviar un archivo válido (jpg/png).")
+        raise ValueError("No se pudo decodificar la imagen (jpg/png).")
     return img
 
 def ensure_3ch(img: np.ndarray) -> np.ndarray:
@@ -160,7 +150,6 @@ def bgr_to_rgb(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 def extract_features(img_bgr: np.ndarray) -> np.ndarray:
-    """Extrae HOG + histograma de intensidades como vector de características."""
     img_bgr = ensure_3ch(img_bgr)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     gray_resized = cv2.resize(gray, WIN_SIZE, interpolation=cv2.INTER_AREA)
@@ -168,26 +157,26 @@ def extract_features(img_bgr: np.ndarray) -> np.ndarray:
     hog = cv2.HOGDescriptor(WIN_SIZE, BLOCK_SIZE, BLOCK_STRIDE, CELL_SIZE, NBINS)
     hog_feat = hog.compute(gray_resized).reshape(-1)
 
-    # Histograma de intensidades (32 bins, normalizado)
     hist = cv2.calcHist([gray_resized], [0], None, [32], [0, 256]).reshape(-1)
     hist = hist / (hist.sum() + 1e-8)
 
     feats = np.concatenate([hog_feat, hist]).astype(np.float32)
     return feats
 
-def capture_snapshot(flush:int=5, delay_ms:int=30) -> np.ndarray:
-    """Lee varios frames para vaciar el buffer y devuelve el último (más fresco)."""
-    logger.info("Capturando imagen")
-    for _ in range(max(0, flush-1)):
-        try:
-            cam.read()
-        except Exception:
-            logger.exception("Error al leer frame durante la captura")
-            break
-        if delay_ms > 0:
-            time.sleep(delay_ms/1000.0)
-    frame = cam.read()
-    logger.info("Imagen capturada")
+def capture_snapshot(flush:int=5, delay_ms:int=30, require_running:bool=True, timeout_ms:int=1500) -> np.ndarray:
+    """
+    Vacía el buffer leyendo varios frames y devuelve el último (fresco).
+    - require_running=True: error inmediato si cámara apagada (no autoarrancar).
+    - timeout_ms: corta si el driver no entrega frame en tiempo.
+    """
+    deadline = time.monotonic() + (timeout_ms / 1000.0)
+    frame = None
+    for i in range(max(1, flush)):
+        if time.monotonic() > deadline:
+            raise TimeoutError("Timeout capturando frame de la cámara.")
+        frame = cam.read(require_running=require_running)
+        if i < flush - 1 and delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
     return frame
 
 # ==========================
@@ -203,7 +192,7 @@ def save_model(model: Pipeline) -> None:
 
 def build_model() -> Pipeline:
     clf = Pipeline([
-        ("scaler", StandardScaler(with_mean=False)),  # with_mean=False para vectores largos
+        ("scaler", StandardScaler(with_mean=False)),
         ("lr", LogisticRegression(max_iter=2000))
     ])
     return clf
@@ -212,10 +201,10 @@ def dataset_iter() -> List[Tuple[str, int]]:
     pairs: List[Tuple[str, int]] = []
     for p in GOOD_DIR.glob("**/*"):
         if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-            pairs.append((str(p), 1))  # 1 = BUENA
+            pairs.append((str(p), 1))
     for p in BAD_DIR.glob("**/*"):
         if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-            pairs.append((str(p), 0))  # 0 = MALA
+            pairs.append((str(p), 0))
     return pairs
 
 def load_dataset() -> Tuple[np.ndarray, np.ndarray]:
@@ -234,7 +223,6 @@ def load_dataset() -> Tuple[np.ndarray, np.ndarray]:
     return X_arr, y_arr
 
 def train_model() -> Dict:
-    logger.info("Inicio de entrenamiento")
     X, y = load_dataset()
     model = build_model()
 
@@ -247,12 +235,17 @@ def train_model() -> Dict:
         dec = model.decision_function(Xte)
         yprob = (dec - dec.min()) / (dec.max() - dec.min() + 1e-8)
 
-    acc = float(accuracy_score(yte, ypred))
+    acc = round(float(accuracy_score(yte, ypred)), 2)
     cm = confusion_matrix(yte, ypred).tolist()
     report = classification_report(yte, ypred, target_names=["MALA", "BUENA"], output_dict=True)
+    # redondeo del report
+    for k, v in list(report.items()):
+        if isinstance(v, dict):
+            for kk, vv in list(v.items()):
+                if isinstance(vv, (int, float)):
+                    report[k][kk] = round(float(vv), 2)
 
     save_model(model)
-    logger.info("Entrenamiento finalizado accuracy=%.3f", acc)
     return {
         "accuracy": acc,
         "confusion_matrix": cm,
@@ -265,7 +258,6 @@ def train_model() -> Dict:
 def predict_image(img_bgr: np.ndarray) -> Dict:
     model = load_model()
     if model is None:
-        logger.error("Predicción solicitada sin modelo entrenado")
         raise RuntimeError("No hay modelo entrenado. Entrena primero con algunas imágenes etiquetadas.")
     feats = extract_features(img_bgr).reshape(1, -1)
     if hasattr(model.named_steps["lr"], "predict_proba"):
@@ -274,8 +266,7 @@ def predict_image(img_bgr: np.ndarray) -> Dict:
         dec = model.decision_function(feats)
         prob_good = float((dec - dec.min()) / (dec.max() - dec.min() + 1e-8))
     label = "BUENA" if prob_good >= 0.5 else "MALA"
-    logger.info("Predicción: %s (prob_good=%.3f)", label, prob_good)
-    return {"label": label, "prob_good": prob_good, "prob_bad": 1.0 - prob_good}
+    return {"label": label, "prob_good": round(prob_good, 2), "prob_bad": round(1.0 - prob_good, 2)}
 
 # ==========================
 # Guardado de ejemplos
@@ -296,7 +287,7 @@ def save_labeled_image(img_bgr: np.ndarray, label: str) -> str:
 # ==========================
 # API FastAPI
 # ==========================
-app = FastAPI(title="DefectDetect API", version="1.3.0")
+app = FastAPI(title="DefectDetect API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -315,85 +306,68 @@ async def api_predict(file: UploadFile = File(None)):
     """
     Clasifica una imagen.
     - Si se envía `file`, clasifica ese archivo.
-    - Si `file` es None, toma snapshot de la webcam persistente.
+    - Si `file` es None, toma snapshot de la webcam persistente (requiere cámara encendida).
     """
-    logger.info("/predict solicitado (archivo=%s)", "sí" if file else "no")
     try:
         if file is None:
-            img = capture_snapshot()
+            img = capture_snapshot(require_running=True)
         else:
             data = await file.read()
             img = imread_any(data)
-        res = predict_image(img)
-        return JSONResponse(res)
-    except Exception as e:
-        logger.exception("Error en /predict")
-        return JSONResponse(status_code=400, content={"error": str(e)})
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=f"camera_off: {e}")
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
+    res = predict_image(img)
+    return JSONResponse(res)
 
 @app.post("/predict_webcam", response_model=PredictResponse)
 async def api_predict_webcam():
-    logger.info("/predict_webcam solicitado")
     try:
-        img = capture_snapshot()
-        res = predict_image(img)
-        return JSONResponse(res)
-    except Exception as e:
-        logger.exception("Error en /predict_webcam")
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        img = capture_snapshot(require_running=True)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=f"camera_off: {e}")
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
+    res = predict_image(img)
+    return JSONResponse(res)
 
 @app.post("/feedback")
 async def api_feedback(label: str = Form(..., description="BUENA o MALA"),
                        file: UploadFile = File(...)):
-    logger.info("/feedback recibido label=%s", label)
-    try:
-        data = await file.read()
-        img = imread_any(data)
-        path = save_labeled_image(img, label)
-        return {"saved": True, "path": path}
-    except Exception as e:
-        logger.exception("Error en /feedback")
-        return JSONResponse(status_code=400, content={"saved": False, "error": str(e)})
+    data = await file.read()
+    img = imread_any(data)
+    path = save_labeled_image(img, label)
+    return {"saved": True, "path": path}
 
 @app.post("/feedback_webcam")
 async def api_feedback_webcam(label: str = Form(..., description="BUENA o MALA")):
-    logger.info("/feedback_webcam label=%s", label)
     try:
-        img = capture_snapshot()
-        path = save_labeled_image(img, label)
-        return {"saved": True, "path": path}
-    except Exception as e:
-        logger.exception("Error en /feedback_webcam")
-        return JSONResponse(status_code=400, content={"saved": False, "error": str(e)})
+        img = capture_snapshot(require_running=True)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=f"camera_off: {e}")
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
+    path = save_labeled_image(img, label)
+    return {"saved": True, "path": path}
 
 @app.post("/train")
 async def api_train():
-    logger.info("/train solicitado")
     try:
         metrics = train_model()
         return {"trained": True, **metrics}
     except Exception as e:
-        logger.exception("Error durante entrenamiento")
         return JSONResponse(status_code=400, content={"trained": False, "error": str(e)})
 
 @app.post("/camera/start")
 async def api_camera_start():
-    logger.info("/camera/start solicitado")
-    try:
-        cam.start()
-        return {"running": True}
-    except Exception as e:
-        logger.exception("Error al iniciar cámara")
-        return JSONResponse(status_code=400, content={"running": False, "error": str(e)})
+    cam.start()
+    return {"running": True}
 
 @app.post("/camera/stop")
 async def api_camera_stop():
-    logger.info("/camera/stop solicitado")
-    try:
-        cam.stop()
-        return {"running": False}
-    except Exception as e:
-        logger.exception("Error al detener cámara")
-        return JSONResponse(status_code=400, content={"running": False, "error": str(e)})
+    cam.stop()
+    return {"running": False}
 
 @app.get("/camera/status")
 async def api_camera_status():
@@ -403,7 +377,7 @@ async def api_camera_status():
 # UI con Gradio (montada en /ui)
 # ==========================
 def ui_classify(image: np.ndarray) -> Tuple[str, Dict[str, float]]:
-    # (Queda por compatibilidad si algún día vuelves a usar el widget de imagen)
+    # por compatibilidad si vuelves a usar el widget de imagen
     if image is None:
         return "Sube o toma una imagen", {}
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -413,71 +387,71 @@ def ui_classify(image: np.ndarray) -> Tuple[str, Dict[str, float]]:
         scores = {"BUENA": r["prob_good"], "MALA": r["prob_bad"]}
         return label, scores
     except Exception as e:
-        logger.exception("Error en ui_classify")
         return str(e), {}
 
-# Clasificar leyendo frame del backend (webcam persistente)
 def ui_classify_backend() -> Tuple[str, Dict[str, float], np.ndarray]:
     try:
-        frame_bgr = capture_snapshot()
+        frame_bgr = capture_snapshot(require_running=True)
         set_last_frame(frame_bgr)
         r = predict_image(frame_bgr)
         label = f"Resultado: {r['label']}"
         scores = {"BUENA": r["prob_good"], "MALA": r["prob_bad"]}
         frame_rgb = bgr_to_rgb(frame_bgr)
         return label, scores, frame_rgb
+    except RuntimeError as e:
+        return f"Error: cámara apagada. Pulsa 'Encender cámara (backend)'. Detalle: {e}", {}, np.zeros((10,10,3), dtype=np.uint8)
+    except TimeoutError as e:
+        return f"Error: timeout capturando frame ({e})", {}, np.zeros((10,10,3), dtype=np.uint8)
     except Exception as e:
-        logger.exception("Error en ui_classify_backend")
         return f"Error: {e}", {}, np.zeros((10,10,3), dtype=np.uint8)
 
-# Tomar foto sin clasificar (solo captura y muestra)
 def ui_take_photo_backend() -> Tuple[str, np.ndarray]:
     try:
-        frame = capture_snapshot()
+        frame = capture_snapshot(require_running=True)
         set_last_frame(frame)
         return "Foto capturada.", bgr_to_rgb(frame)
-    except Exception as e:
-        logger.exception("Error en ui_take_photo_backend")
-        return f"Error al capturar: {e}", np.zeros((10,10,3), dtype=np.uint8)
+    except RuntimeError as e:
+        return f"Error: cámara apagada. Pulsa 'Encender cámara (backend)'. Detalle: {e}", np.zeros((10,10,3), dtype=np.uint8)
+    except TimeoutError as e:
+        return f"Error: timeout capturando frame ({e})", np.zeros((10,10,3), dtype=np.uint8)
 
-# Guardar última foto como BUENA desde backend
 def ui_save_good_backend() -> Tuple[str, np.ndarray]:
     try:
         frame = get_last_frame()
         if frame is None:
-            frame = capture_snapshot()
+            frame = capture_snapshot(require_running=True)
             set_last_frame(frame)
         path = save_labeled_image(frame, "BUENA")
         return f"Guardada como BUENA: {path}", bgr_to_rgb(frame)
-    except Exception as e:
-        logger.exception("Error en ui_save_good_backend")
-        return f"Error: {e}", np.zeros((10,10,3), dtype=np.uint8)
+    except RuntimeError as e:
+        return f"Error: cámara apagada. {e}", np.zeros((10,10,3), dtype=np.uint8)
+    except TimeoutError as e:
+        return f"Error: timeout ({e})", np.zeros((10,10,3), dtype=np.uint8)
 
-# Guardar última foto como MALA desde backend
 def ui_save_bad_backend() -> Tuple[str, np.ndarray]:
     try:
         frame = get_last_frame()
         if frame is None:
-            frame = capture_snapshot()
+            frame = capture_snapshot(require_running=True)
             set_last_frame(frame)
         path = save_labeled_image(frame, "MALA")
         return f"Guardada como MALA: {path}", bgr_to_rgb(frame)
-    except Exception as e:
-        logger.exception("Error en ui_save_bad_backend")
-        return f"Error: {e}", np.zeros((10,10,3), dtype=np.uint8)
+    except RuntimeError as e:
+        return f"Error: cámara apagada. {e}", np.zeros((10,10,3), dtype=np.uint8)
+    except TimeoutError as e:
+        return f"Error: timeout ({e})", np.zeros((10,10,3), dtype=np.uint8)
 
 def ui_train() -> str:
     try:
         m = train_model()
         return (
-            "Entrenado. Accuracy: {acc:.3f}. Train/Test: {ntr}/{nte}\n".format(
+            "Entrenado. Accuracy: {acc:.2f}. Train/Test: {ntr}/{nte}\n".format(
                 acc=m["accuracy"], ntr=m["n_train"], nte=m["n_test"]
             )
             + "Matriz de confusión: "
             + json.dumps(m["confusion_matrix"])
         )
     except Exception as e:
-        logger.exception("Error en ui_train")
         return f"Error al entrenar: {e}"
 
 with gr.Blocks(title="DefectDetect UI") as demo:
@@ -498,7 +472,7 @@ with gr.Blocks(title="DefectDetect UI") as demo:
         btn_bad  = gr.Button("Marcar MALA ❌ (última foto)")
         btn_train= gr.Button("Entrenar / Actualizar modelo")
 
-    # Botones backend cámara
+    # Cámara backend
     def ui_camera_start():
         cam.start()
         return "Cámara backend encendida"
@@ -520,7 +494,6 @@ with gr.Blocks(title="DefectDetect UI") as demo:
     btn_train.click(fn=ui_train, inputs=None, outputs=out_text)
 
 # Montar Gradio dentro de FastAPI
-from fastapi.middleware.wsgi import WSGIMiddleware
 app = gr.mount_gradio_app(app, demo, path="/ui")
 
 # ==========================
