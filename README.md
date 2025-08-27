@@ -16,7 +16,7 @@ Crea un entorno virtual e instala dependencias:
 ### Windows (PowerShell)
 ```powershell
 py -m venv .venv
-.\.venv\Scripts ctivate
+.\.venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -49,6 +49,20 @@ Controla el nivel de logging con la variable de entorno `LOG_LEVEL` (por ejemplo
 ```bash
 export LOG_LEVEL=DEBUG  # Linux / Mac
 set LOG_LEVEL=DEBUG     # Windows CMD
+
+
+## ⚙️ Variables de entorno de la cámara
+
+`app.py` usa las variables `CAMERA_INDEX`, `CAMERA_WIDTH` y `CAMERA_HEIGHT` 
+para configurar la webcam (por defecto 0, 1280 y 720).
+Configúralas antes de ejecutar si necesitas otros valores.
+
+```bash
+export CAMERA_INDEX=1
+export CAMERA_WIDTH=640
+export CAMERA_HEIGHT=480
+python app.py
+
 ```
 
 ## 📸 Flujo de trabajo
@@ -77,10 +91,17 @@ Para empezar de cero, borra:
 - `models/model.pkl`
 - imágenes dentro de `data/good/` y `data/bad/`
 
+Actualmente no se incluye un script `reset_dataset.py`. Si quieres automatizar este proceso, crea un archivo con ese nombre que elimine `models/model.pkl` y limpie las carpetas `data/good/` y `data/bad/`.
+
 ## 📦 Requisitos
 
 Ver archivo `requirements.txt`.
 
+> **Compatibilidad:** las dependencias están fijadas con versiones mínimas (`>=`).
+> Se ha probado con las versiones listadas, pero versiones superiores no se han verificado exhaustivamente.
+
 ## 📜 Licencia
 
-MIT
+
+Este proyecto se distribuye bajo la [Licencia MIT](LICENSE).
+
