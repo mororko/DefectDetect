@@ -30,6 +30,7 @@ import threading
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Union
 
+import logging
 import cv2
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -45,6 +46,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import gradio as gr
+
+# ==========================
+# Logging
+# ==========================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger(__name__)
 
 # ==========================
 # Configuración
@@ -85,19 +93,23 @@ class CameraManager:
     def start(self):
         with self.lock:
             if self.running:
+                logger.debug("Camera already running")
                 return
             self.cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(self.index)
             if not self.cap.isOpened():
+                logger.error("No se pudo abrir la cámara index=%s", self.index)
                 self.cap = None
                 raise RuntimeError(f"No se pudo abrir la cámara index={self.index}")
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
             self.running = True
+            logger.info("Cámara iniciada (index=%s)", self.index)
 
     def stop(self):
         with self.lock:
             if self.cap is not None:
                 self.cap.release()
+                logger.info("Cámara detenida")
             self.cap = None
             self.running = False
 
@@ -105,9 +117,11 @@ class CameraManager:
         with self.lock:
             if not self.running or self.cap is None:
                 # Arrancar automáticamente si no está corriendo
+                logger.debug("Cámara no estaba activa, iniciando automáticamente")
                 self.start()
             ok, frame = self.cap.read()
             if not ok or frame is None:
+                logger.error("Fallo al leer frame de la cámara")
                 raise RuntimeError("Fallo al leer frame de la cámara.")
             return frame
 
@@ -163,15 +177,18 @@ def extract_features(img_bgr: np.ndarray) -> np.ndarray:
 
 def capture_snapshot(flush:int=5, delay_ms:int=30) -> np.ndarray:
     """Lee varios frames para vaciar el buffer y devuelve el último (más fresco)."""
+    logger.info("Capturando imagen")
     for _ in range(max(0, flush-1)):
         try:
             cam.read()
         except Exception:
+            logger.exception("Error al leer frame durante la captura")
             break
-        # micro pausa
         if delay_ms > 0:
             time.sleep(delay_ms/1000.0)
-    return cam.read()
+    frame = cam.read()
+    logger.info("Imagen capturada")
+    return frame
 
 # ==========================
 # Modelo
@@ -217,6 +234,7 @@ def load_dataset() -> Tuple[np.ndarray, np.ndarray]:
     return X_arr, y_arr
 
 def train_model() -> Dict:
+    logger.info("Inicio de entrenamiento")
     X, y = load_dataset()
     model = build_model()
 
@@ -234,6 +252,7 @@ def train_model() -> Dict:
     report = classification_report(yte, ypred, target_names=["MALA", "BUENA"], output_dict=True)
 
     save_model(model)
+    logger.info("Entrenamiento finalizado accuracy=%.3f", acc)
     return {
         "accuracy": acc,
         "confusion_matrix": cm,
@@ -246,6 +265,7 @@ def train_model() -> Dict:
 def predict_image(img_bgr: np.ndarray) -> Dict:
     model = load_model()
     if model is None:
+        logger.error("Predicción solicitada sin modelo entrenado")
         raise RuntimeError("No hay modelo entrenado. Entrena primero con algunas imágenes etiquetadas.")
     feats = extract_features(img_bgr).reshape(1, -1)
     if hasattr(model.named_steps["lr"], "predict_proba"):
@@ -254,6 +274,7 @@ def predict_image(img_bgr: np.ndarray) -> Dict:
         dec = model.decision_function(feats)
         prob_good = float((dec - dec.min()) / (dec.max() - dec.min() + 1e-8))
     label = "BUENA" if prob_good >= 0.5 else "MALA"
+    logger.info("Predicción: %s (prob_good=%.3f)", label, prob_good)
     return {"label": label, "prob_good": prob_good, "prob_bad": 1.0 - prob_good}
 
 # ==========================
@@ -296,51 +317,83 @@ async def api_predict(file: UploadFile = File(None)):
     - Si se envía `file`, clasifica ese archivo.
     - Si `file` es None, toma snapshot de la webcam persistente.
     """
-    if file is None:
-        img = capture_snapshot()
-    else:
-        data = await file.read()
-        img = imread_any(data)
-    res = predict_image(img)
-    return JSONResponse(res)
+    logger.info("/predict solicitado (archivo=%s)", "sí" if file else "no")
+    try:
+        if file is None:
+            img = capture_snapshot()
+        else:
+            data = await file.read()
+            img = imread_any(data)
+        res = predict_image(img)
+        return JSONResponse(res)
+    except Exception as e:
+        logger.exception("Error en /predict")
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/predict_webcam", response_model=PredictResponse)
 async def api_predict_webcam():
-    img = capture_snapshot()
-    res = predict_image(img)
-    return JSONResponse(res)
+    logger.info("/predict_webcam solicitado")
+    try:
+        img = capture_snapshot()
+        res = predict_image(img)
+        return JSONResponse(res)
+    except Exception as e:
+        logger.exception("Error en /predict_webcam")
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/feedback")
 async def api_feedback(label: str = Form(..., description="BUENA o MALA"),
                        file: UploadFile = File(...)):
-    data = await file.read()
-    img = imread_any(data)
-    path = save_labeled_image(img, label)
-    return {"saved": True, "path": path}
+    logger.info("/feedback recibido label=%s", label)
+    try:
+        data = await file.read()
+        img = imread_any(data)
+        path = save_labeled_image(img, label)
+        return {"saved": True, "path": path}
+    except Exception as e:
+        logger.exception("Error en /feedback")
+        return JSONResponse(status_code=400, content={"saved": False, "error": str(e)})
 
 @app.post("/feedback_webcam")
 async def api_feedback_webcam(label: str = Form(..., description="BUENA o MALA")):
-    img = capture_snapshot()
-    path = save_labeled_image(img, label)
-    return {"saved": True, "path": path}
+    logger.info("/feedback_webcam label=%s", label)
+    try:
+        img = capture_snapshot()
+        path = save_labeled_image(img, label)
+        return {"saved": True, "path": path}
+    except Exception as e:
+        logger.exception("Error en /feedback_webcam")
+        return JSONResponse(status_code=400, content={"saved": False, "error": str(e)})
 
 @app.post("/train")
 async def api_train():
+    logger.info("/train solicitado")
     try:
         metrics = train_model()
         return {"trained": True, **metrics}
     except Exception as e:
+        logger.exception("Error durante entrenamiento")
         return JSONResponse(status_code=400, content={"trained": False, "error": str(e)})
 
 @app.post("/camera/start")
 async def api_camera_start():
-    cam.start()
-    return {"running": True}
+    logger.info("/camera/start solicitado")
+    try:
+        cam.start()
+        return {"running": True}
+    except Exception as e:
+        logger.exception("Error al iniciar cámara")
+        return JSONResponse(status_code=400, content={"running": False, "error": str(e)})
 
 @app.post("/camera/stop")
 async def api_camera_stop():
-    cam.stop()
-    return {"running": False}
+    logger.info("/camera/stop solicitado")
+    try:
+        cam.stop()
+        return {"running": False}
+    except Exception as e:
+        logger.exception("Error al detener cámara")
+        return JSONResponse(status_code=400, content={"running": False, "error": str(e)})
 
 @app.get("/camera/status")
 async def api_camera_status():
@@ -360,6 +413,7 @@ def ui_classify(image: np.ndarray) -> Tuple[str, Dict[str, float]]:
         scores = {"BUENA": r["prob_good"], "MALA": r["prob_bad"]}
         return label, scores
     except Exception as e:
+        logger.exception("Error en ui_classify")
         return str(e), {}
 
 # Clasificar leyendo frame del backend (webcam persistente)
@@ -373,6 +427,7 @@ def ui_classify_backend() -> Tuple[str, Dict[str, float], np.ndarray]:
         frame_rgb = bgr_to_rgb(frame_bgr)
         return label, scores, frame_rgb
     except Exception as e:
+        logger.exception("Error en ui_classify_backend")
         return f"Error: {e}", {}, np.zeros((10,10,3), dtype=np.uint8)
 
 # Tomar foto sin clasificar (solo captura y muestra)
@@ -382,6 +437,7 @@ def ui_take_photo_backend() -> Tuple[str, np.ndarray]:
         set_last_frame(frame)
         return "Foto capturada.", bgr_to_rgb(frame)
     except Exception as e:
+        logger.exception("Error en ui_take_photo_backend")
         return f"Error al capturar: {e}", np.zeros((10,10,3), dtype=np.uint8)
 
 # Guardar última foto como BUENA desde backend
@@ -394,6 +450,7 @@ def ui_save_good_backend() -> Tuple[str, np.ndarray]:
         path = save_labeled_image(frame, "BUENA")
         return f"Guardada como BUENA: {path}", bgr_to_rgb(frame)
     except Exception as e:
+        logger.exception("Error en ui_save_good_backend")
         return f"Error: {e}", np.zeros((10,10,3), dtype=np.uint8)
 
 # Guardar última foto como MALA desde backend
@@ -406,6 +463,7 @@ def ui_save_bad_backend() -> Tuple[str, np.ndarray]:
         path = save_labeled_image(frame, "MALA")
         return f"Guardada como MALA: {path}", bgr_to_rgb(frame)
     except Exception as e:
+        logger.exception("Error en ui_save_bad_backend")
         return f"Error: {e}", np.zeros((10,10,3), dtype=np.uint8)
 
 def ui_train() -> str:
@@ -419,6 +477,7 @@ def ui_train() -> str:
             + json.dumps(m["confusion_matrix"])
         )
     except Exception as e:
+        logger.exception("Error en ui_train")
         return f"Error al entrenar: {e}"
 
 with gr.Blocks(title="DefectDetect UI") as demo:

@@ -42,6 +42,15 @@ Abre en tu navegador:
 - **UI de Gradio:** [http://127.0.0.1:7860/ui](http://127.0.0.1:7860/ui)
 - **API docs (Swagger):** [http://127.0.0.1:7860/docs](http://127.0.0.1:7860/docs)
 
+### Configuración de logging
+
+Controla el nivel de logging con la variable de entorno `LOG_LEVEL` (por ejemplo `DEBUG`, `INFO`, `WARNING`).
+
+```bash
+export LOG_LEVEL=DEBUG  # Linux / Mac
+set LOG_LEVEL=DEBUG     # Windows CMD
+```
+
 ## 📸 Flujo de trabajo
 
 1. **Encender cámara (backend)** desde la UI o con `POST /camera/start`.
