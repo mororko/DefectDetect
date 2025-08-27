@@ -74,4 +74,5 @@ Ver archivo `requirements.txt`.
 
 ## 📜 Licencia
 
-MIT
+Este proyecto se distribuye bajo la [Licencia MIT](LICENSE).
+
