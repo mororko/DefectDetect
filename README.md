@@ -87,6 +87,11 @@ Actualmente no se incluye un script `reset_dataset.py`. Si quieres automatizar e
 
 Ver archivo `requirements.txt`.
 
+> **Compatibilidad:** las dependencias están fijadas con versiones mínimas (`>=`).
+> Se ha probado con las versiones listadas, pero versiones superiores no se han verificado exhaustivamente.
+
 ## 📜 Licencia
 
-MIT
+
+Este proyecto se distribuye bajo la [Licencia MIT](LICENSE).
+
