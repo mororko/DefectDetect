@@ -16,7 +16,7 @@ Crea un entorno virtual e instala dependencias:
 ### Windows (PowerShell)
 ```powershell
 py -m venv .venv
-.\.venv\Scripts ctivate
+.\.venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
@@ -41,6 +41,19 @@ Abre en tu navegador:
 
 - **UI de Gradio:** [http://127.0.0.1:7860/ui](http://127.0.0.1:7860/ui)
 - **API docs (Swagger):** [http://127.0.0.1:7860/docs](http://127.0.0.1:7860/docs)
+
+## ⚙️ Variables de entorno de la cámara
+
+`app.py` usa las variables `CAMERA_INDEX`, `CAMERA_WIDTH` y `CAMERA_HEIGHT` 
+para configurar la webcam (por defecto 0, 1280 y 720).
+Configúralas antes de ejecutar si necesitas otros valores.
+
+```bash
+export CAMERA_INDEX=1
+export CAMERA_WIDTH=640
+export CAMERA_HEIGHT=480
+python app.py
+```
 
 ## 📸 Flujo de trabajo
 
@@ -68,6 +81,8 @@ Para empezar de cero, borra:
 - `models/model.pkl`
 - imágenes dentro de `data/good/` y `data/bad/`
 
+Actualmente no se incluye un script `reset_dataset.py`. Si quieres automatizar este proceso, crea un archivo con ese nombre que elimine `models/model.pkl` y limpie las carpetas `data/good/` y `data/bad/`.
+
 ## 📦 Requisitos
 
 Ver archivo `requirements.txt`.
@@ -79,5 +94,4 @@ Ver archivo `requirements.txt`.
 
 
 Este proyecto se distribuye bajo la [Licencia MIT](LICENSE).
-
 
