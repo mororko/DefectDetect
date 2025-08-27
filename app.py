@@ -39,7 +39,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 import joblib
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -118,18 +118,27 @@ class CameraManager:
 
 cam = CameraManager()
 
-# Última foto capturada (para etiquetar/mostrar)
+# ==========================
+# Última foto (estado compartido UI/API)
+# ==========================
 LAST_FRAME: Optional[np.ndarray] = None
+LAST_VERSION: int = 0
 _LAST_LOCK = threading.Lock()
 
 def set_last_frame(frame: np.ndarray) -> None:
-    global LAST_FRAME
+    """Guarda la última foto y sube la versión para que la UI se actualice sola."""
+    global LAST_FRAME, LAST_VERSION
     with _LAST_LOCK:
         LAST_FRAME = frame.copy()
+        LAST_VERSION += 1
 
 def get_last_frame() -> Optional[np.ndarray]:
     with _LAST_LOCK:
         return None if LAST_FRAME is None else LAST_FRAME.copy()
+
+def get_last_version() -> int:
+    with _LAST_LOCK:
+        return LAST_VERSION
 
 # ==========================
 # Utilidades de imagen
@@ -287,7 +296,7 @@ def save_labeled_image(img_bgr: np.ndarray, label: str) -> str:
 # ==========================
 # API FastAPI
 # ==========================
-app = FastAPI(title="DefectDetect API", version="1.4.0")
+app = FastAPI(title="DefectDetect API", version="1.5.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -311,6 +320,7 @@ async def api_predict(file: UploadFile = File(None)):
     try:
         if file is None:
             img = capture_snapshot(require_running=True)
+            set_last_frame(img)  # <-- actualiza la UI
         else:
             data = await file.read()
             img = imread_any(data)
@@ -325,6 +335,7 @@ async def api_predict(file: UploadFile = File(None)):
 async def api_predict_webcam():
     try:
         img = capture_snapshot(require_running=True)
+        set_last_frame(img)  # <-- actualiza la UI
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=f"camera_off: {e}")
     except TimeoutError as e:
@@ -344,6 +355,7 @@ async def api_feedback(label: str = Form(..., description="BUENA o MALA"),
 async def api_feedback_webcam(label: str = Form(..., description="BUENA o MALA")):
     try:
         img = capture_snapshot(require_running=True)
+        set_last_frame(img)  # opcional
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=f"camera_off: {e}")
     except TimeoutError as e:
@@ -372,6 +384,17 @@ async def api_camera_stop():
 @app.get("/camera/status")
 async def api_camera_status():
     return {"running": cam.running, "index": cam.index, "width": cam.width, "height": cam.height}
+
+# (Opcional) Ver la última foto directamente como JPG
+@app.get("/last_frame.jpg")
+async def last_frame_jpg():
+    frame = get_last_frame()
+    if frame is None:
+        raise HTTPException(status_code=404, detail="No hay foto disponible")
+    ok, buf = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Error codificando imagen")
+    return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 # ==========================
 # UI con Gradio (montada en /ui)
@@ -454,6 +477,24 @@ def ui_train() -> str:
     except Exception as e:
         return f"Error al entrenar: {e}"
 
+# ---- Pull desde la UI para sincronizar cuando se llama /predict_webcam vía API ----
+def ui_pull_last(prev_version: int):
+    """
+    Si hay nueva foto (versión distinta), devuelve (versión, imagen RGB actualizada).
+    Si no hay cambios, mantiene la versión y no toca la imagen (gr.update()).
+    """
+    try:
+        ver = get_last_version()
+        if ver != prev_version:
+            frame = get_last_frame()
+            if frame is None:
+                return ver, gr.update()
+            return ver, gr.update(value=bgr_to_rgb(frame))
+        else:
+            return prev_version, gr.update()
+    except Exception:
+        return prev_version, gr.update()
+
 with gr.Blocks(title="DefectDetect UI") as demo:
     gr.Markdown("# DefectDetect\nBackend: captura, etiqueta, entrena y clasifica.")
 
@@ -462,6 +503,9 @@ with gr.Blocks(title="DefectDetect UI") as demo:
         lbl = gr.Label(label="Probabilidades")
 
     out_text = gr.Textbox(label="Estado / Resultado", interactive=False)
+
+    # Estado de versión para sincronizar UI <-> API
+    ver_state = gr.State(0)
 
     with gr.Row():
         btn_on   = gr.Button("Encender cámara (backend)")
@@ -492,6 +536,13 @@ with gr.Blocks(title="DefectDetect UI") as demo:
 
     # Entrenamiento
     btn_train.click(fn=ui_train, inputs=None, outputs=out_text)
+
+    # Timer: refresca la última imagen si la API externo tomó una nueva (cada 0.5 s)
+    gr.Timer(0.5).tick(
+        fn=ui_pull_last,
+        inputs=[ver_state],
+        outputs=[ver_state, out_img]
+    )
 
 # Montar Gradio dentro de FastAPI
 app = gr.mount_gradio_app(app, demo, path="/ui")
