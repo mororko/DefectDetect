@@ -72,7 +72,12 @@ Para empezar de cero, borra:
 
 Ver archivo `requirements.txt`.
 
+> **Compatibilidad:** las dependencias están fijadas con versiones mínimas (`>=`).
+> Se ha probado con las versiones listadas, pero versiones superiores no se han verificado exhaustivamente.
+
 ## 📜 Licencia
 
+
 Este proyecto se distribuye bajo la [Licencia MIT](LICENSE).
+
 
